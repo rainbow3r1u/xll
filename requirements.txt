@@ -1,0 +1,9 @@
+torch>=2.0
+pandas
+numpy
+requests
+huggingface_hub
+tqdm
+einops
+safetensors
+

@@ -1,0 +1,5 @@
+kronos_pretrained/
+*.safetensors
+*.tar.gz
+*.pkl
+__pycache__/
