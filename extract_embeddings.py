@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
 提取 Kronos-base 内部 Context Vector (embedding)
-每256天BTC窗口 → 832维隐状态 → 压缩保存
-GPU推理, 不训练, 不会过拟合
+每256天BTC窗口 → 832维隐状态 → PCA压缩 → 20维保存
+
+用法:
+  python extract_embeddings.py            # 全新提取 (首次)
+  python extract_embeddings.py --update   # 增量更新 (每周一次, GPU推理)
+
+周常: 每周在GPU服务器跑一次 --update, 传回替换 kronos_embeddings.json
 """
-import os, sys, json, numpy as np
+import os, sys, json, argparse, numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
@@ -12,19 +17,25 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kronos_model.kronos import Kronos, KronosTokenizer
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--update', action='store_true', help='增量更新模式')
+parser.add_argument('--refit-pca', action='store_true', help='强制重算PCA')
+args = parser.parse_args()
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"设备: {DEVICE}")
 
-# ─── 1. 加载模型 ───
+OUTPUT = os.path.join(os.path.dirname(__file__), 'kronos_embeddings.json')
 LOCAL_MODEL = os.path.join(os.path.dirname(__file__), 'kronos_pretrained/Kronos-base')
 LOCAL_TOKENIZER = os.path.join(os.path.dirname(__file__), 'kronos_pretrained/Kronos-Tokenizer-base')
 
+# 加载模型
 print("加载 Kronos-base...")
 model = Kronos.from_pretrained(LOCAL_MODEL).to(DEVICE)
 tokenizer = KronosTokenizer.from_pretrained(LOCAL_TOKENIZER).to(DEVICE)
 model.eval()
 
-# ─── 2. 加载BTC数据 ───
+# 加载BTC数据
 with open(os.path.join(os.path.dirname(__file__), 'btc_klines.json')) as f:
     kls = json.load(f)
 
@@ -38,98 +49,124 @@ df = df.set_index('datetime').sort_index()
 
 cols = ['open', 'high', 'low', 'close', 'volume', 'quote_vol']
 data = df[cols].values.astype(np.float32)
-
-# Z-score归一化
 mean = data.mean(axis=0, keepdims=True)
 std = data.std(axis=0, keepdims=True) + 1e-8
 data_norm = (data - mean) / std
-
-CONTEXT_DAYS = 256
-MIN_START = 200  # 至少200天历史才开始提取
-MAX_WINDOWS = 1500  # 最多处理1500个窗口
-
-print(f"BTC数据: {len(data)}天, 提取窗口: {MIN_START}→{min(len(data), MIN_START+MAX_WINDOWS)}")
-
-# ─── 3. 提取 Context Vector ───
-embeddings = {}  # {timestamp_int: [embedding_list]}
 timestamps = df.index
 
-pbar = tqdm(range(MIN_START, min(len(data), MIN_START + MAX_WINDOWS)),
-            desc="提取 embedding")
-for i in pbar:
-    if i < CONTEXT_DAYS:
-        continue
+CONTEXT_DAYS = 256
+MIN_START = 200
 
+# 增量模式: 只处理新时间戳
+existing_ts = set()
+old_pca = None
+old_scaler = None
+if args.update and os.path.exists(OUTPUT):
+    print(f"[增量] 加载现有 embeddings: {OUTPUT}")
+    with open(OUTPUT) as f:
+        old = json.load(f)
+    existing_ts = set(old['embeddings'].keys())
+    old_pca = (old.get('pca_components'), old.get('pca_mean'))
+    old_scaler = (old.get('scaler_mean'), old.get('scaler_scale'))
+    print(f"  已有 {len(existing_ts)} 个时间点")
+
+# 找出需要提取的窗口
+to_extract = []
+for i in range(MIN_START, len(data)):
     ts = int(timestamps[i].timestamp())
-    ctx_data = data_norm[i - CONTEXT_DAYS:i]  # (256, 6)
+    ts_str = str(ts)
+    if ts_str not in existing_ts:
+        to_extract.append(i)
 
-    x = torch.FloatTensor(ctx_data).unsqueeze(0).to(DEVICE)  # (1, 256, 6)
+if not to_extract:
+    print("所有时间点已存在, 无需更新")
+    sys.exit(0)
 
+print(f"需提取: {len(to_extract)} 个新窗口")
+
+# 提取新embeddings
+new_embeddings = {}
+pbar = tqdm(to_extract, desc="提取 embedding")
+for i in pbar:
+    ts = int(timestamps[i].timestamp())
+    ctx_data = data_norm[i - CONTEXT_DAYS:i]
+
+    x = torch.FloatTensor(ctx_data).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         tokens = tokenizer.encode(x, half=True)
         s1_ids, s2_ids = tokens[0], tokens[1]
 
-        # 构建时间戳
-        x_stamp = torch.zeros(1, CONTEXT_DAYS, 3, device=DEVICE)
-        x_stamp[:, :, 0] = torch.arange(CONTEXT_DAYS)
+        # 时间戳: [minute, hour, weekday, day, month] 5列
+        window_dates = timestamps[i - CONTEXT_DAYS:i]
+        x_stamp = torch.zeros(1, CONTEXT_DAYS, 5, dtype=torch.long, device=DEVICE)
+        x_stamp[:, :, 0] = torch.LongTensor([d.minute for d in window_dates])
+        x_stamp[:, :, 1] = torch.LongTensor([d.hour for d in window_dates])
+        x_stamp[:, :, 2] = torch.LongTensor([d.weekday() for d in window_dates])
+        x_stamp[:, :, 3] = torch.LongTensor([d.day for d in window_dates])
+        x_stamp[:, :, 4] = torch.LongTensor([d.month for d in window_dates])
 
         s1_logits, context = model.decode_s1(s1_ids, s2_ids, x_stamp)
+        vec = context[:, -1, :].squeeze(0).cpu().numpy()
 
-        # context: (1, 832) — 取最后一个位置
-        vec = context[:, -1, :].squeeze(0).cpu().numpy()  # (832,)
+    new_embeddings[str(ts)] = vec.tolist()
 
-        # 再用 decode_s2 取 post 部分的信息
-        # 取 s1 最后一个 token 作为输入
-        last_s1 = s1_ids[:, -1:]  # (1, 1)
-        s2_logits = model.decode_s2(context[:, -1:, :], last_s1)
-        # s2_logits[-1] 是预测的s2分布
+print(f"新提取: {len(new_embeddings)} 个")
 
-    embeddings[str(ts)] = vec.tolist()
+# 合并
+if args.update and existing_ts:
+    all_embeddings = {k: v for k, v in old['embeddings'].items()}
+else:
+    all_embeddings = {}
+all_embeddings.update(new_embeddings)
 
-print(f"\n提取完成: {len(embeddings)} 个时间点, 每点 {len(vec)} 维")
+all_ts = sorted(all_embeddings.keys())
+all_vecs = np.array([all_embeddings[ts] for ts in all_ts])
+print(f"全量: {all_vecs.shape}")
 
-# ─── 4. PCA 压缩到 20 维 ───
-# 用 sklearn PCA, 保留95%方差 → 自动选维度
+# PCA
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-all_ts = sorted(embeddings.keys())
-all_vecs = np.array([embeddings[ts] for ts in all_ts])
+if args.update and old_pca is not None and not args.refit_pca:
+    # 用旧PCA投影新点
+    print("[增量] 使用已有PCA变换")
+    scaler = StandardScaler()
+    scaler.mean_ = np.array(old_scaler[0])
+    scaler.scale_ = np.array(old_scaler[1])
+    vecs_scaled = scaler.transform(all_vecs)
+    pca = PCA(n_components=len(old_pca[0]))
+    pca.components_ = np.array(old_pca[0])
+    pca.mean_ = np.array(old_pca[1])
+    vecs_pca20 = pca.transform(vecs_scaled)
+    variance = float(np.var(vecs_pca20).sum() / np.var(vecs_scaled).sum() * 100)
+    # rough estimate
+    variance = old.get('variance_retained', 77.9)
+else:
+    # 重新拟合PCA
+    print("[重算] PCA...")
+    scaler = StandardScaler()
+    vecs_scaled = scaler.fit_transform(all_vecs)
+    pca = PCA(n_components=20)
+    vecs_pca20 = pca.fit_transform(vecs_scaled)
+    variance = float(pca.explained_variance_ratio_.sum())
 
-print(f"全量: {all_vecs.shape}")
+print(f"PCA 20维: 方差保留 {variance*100:.1f}%")
 
-# 标准化
-scaler = StandardScaler()
-vecs_scaled = scaler.fit_transform(all_vecs)
-
-# PCA 保留 95% 方差
-pca_full = PCA(n_components=0.95, svd_solver='full')
-vecs_pca_full = pca_full.fit_transform(vecs_scaled)
-print(f"PCA 95%方差: {pca_full.n_components_} 维")
-
-# 同时输出固定20维的版本
-pca20 = PCA(n_components=20)
-vecs_pca20 = pca20.fit_transform(vecs_scaled)
-print(f"PCA 20维: 方差保留 {pca20.explained_variance_ratio_.sum()*100:.1f}%")
-
-# ─── 5. 保存 ───
+# 保存
 output = {
     'embeddings': {ts: vecs_pca20[i].tolist() for i, ts in enumerate(all_ts)},
-    'pca_components': pca20.components_.tolist(),
-    'pca_mean': pca20.mean_.tolist(),
+    'pca_components': pca.components_.tolist(),
+    'pca_mean': pca.mean_.tolist(),
     'scaler_mean': scaler.mean_.tolist(),
     'scaler_scale': scaler.scale_.tolist(),
-    'variance_retained': float(pca20.explained_variance_ratio_.sum()),
+    'variance_retained': variance,
     'n_dim': 20,
     'total_timestamps': len(all_ts),
+    'last_updated': str(pd.Timestamp.now()),
 }
 
-outfile = os.path.join(os.path.dirname(__file__), 'kronos_embeddings.json')
-with open(outfile, 'w') as f:
+with open(OUTPUT, 'w') as f:
     json.dump(output, f)
 
-print(f"\n保存: {outfile} ({os.path.getsize(outfile)/1024:.0f}KB)")
-print(f"服务器使用:")
-print(f"  1. 复制到 /home/myuser/websocket_new/data/kronos_embeddings.json")
-print(f"  2. daily_predictor.py 加载: 20维替代原来3维kronos特征")
-print(f"  3. 新特征8维: 前5个PCA分量 + 3个统计值(dir/vol/long)")
+print(f"\n保存: {OUTPUT} ({os.path.getsize(OUTPUT)/1024:.0f}KB)")
+print(f"时间点: {len(all_ts)} (新增 {len(new_embeddings)})")
